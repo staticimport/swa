@@ -2,11 +2,10 @@
 
 require 'mail'
 require 'mechanize'
-require 'pony'
 require 'twilio-ruby' 
 
 def init_logger()
-  file = File.new("#{$PROGRAM_NAME}.log", "a")
+  file = File.new("#{File::basename($PROGRAM_NAME).split('.')[0]}.log", "a")
   file.sync = true
   return Logger.new(file)
 end
