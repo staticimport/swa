@@ -160,6 +160,7 @@ raise "USAGE: #{$PROGRAM_NAME} <personals.txt> <trips.txt>" unless ARGV.length =
 personals = load_personals(ARGV[0])
 trips     = load_trips(ARGV[1])
 
+last_alert_time = Time.now
 while(true)
   LOG.info("scraping...")
   trips.each do |trip|
@@ -202,6 +203,7 @@ while(true)
         new_text.split("\n").each { |line| LOG.info(line.chomp) }
         if trip[:old_text]
           send_sms(new_text, personals)
+          last_alert_time = Time.now
         end
       else
         LOG.info("no change for #{trip}")
@@ -211,7 +213,15 @@ while(true)
       LOG.error("failed to fetch details for #{trip}")
     end
   end
-  sleep_seconds = 60 + rand(120) # randomization not to appear scripted
+
+  # need to send a heartbeat?
+  if Time.now - last_alert_time > 24 * 60 * 60
+    send_sms("still alive!")
+    last_alert_time = Time.now
+  end
+
+  # sleep random interval as not to appear scripted
+  sleep_seconds = 60 + rand(120)
   LOG.info("will sleep for #{sleep_seconds} seconds until next scrape")
   sleep(sleep_seconds)
 end
