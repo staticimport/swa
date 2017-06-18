@@ -215,7 +215,9 @@ while(true)
   end
 
   # need to send a heartbeat?
-  if Time.now - last_alert_time > 24 * 60 * 60
+  hours_since_last_alert = (Time.now - last_alert_time) / 60 / 60
+  LOG.info("#{hours_since_last_alert.round(3)} hours since startup or last alert")
+  if hours_since_last_alert >= 24
     send_sms("still alive!")
     last_alert_time = Time.now
   end
