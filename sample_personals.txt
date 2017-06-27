@@ -1,5 +1,13 @@
-from=+15551234567
-to=+15557654321
-twilio_account_sid=sid
-twilio_auth_token=token
+sms.enabled=false
+sms.from=+15551234567
+sms.to=+15557654321
+sms.twilio_account_sid=sid
+sms.twilio_auth_token=token
+
+email.enabled=true
+email.smtp=smtp.gmail.com
+email.port=587
+email.username=mailaccount@gmail.com
+email.password=password
+email.to=address1@gmail.com,address2@gmail.com
 

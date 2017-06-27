@@ -2,6 +2,7 @@
 
 require 'mail'
 require 'mechanize'
+require 'socket'
 require 'twilio-ruby' 
 
 def init_logger()
@@ -77,29 +78,90 @@ class ResultSet
   def sorted
     @key_to_best.values.sort
   end
+  def time_to_bucket_key(time)
+    minutes = minutes_since_midnight(time)
+    if minutes < 6 * 60
+      return :early
+    elsif minutes < 12 * 60
+      return :morning
+    elsif minutes < 18 * 60
+      return :afternoon
+    else
+      return :evening
+    end
+  end
   def aggregated_bests
-    minute_bucket_size = 6 * 60
-    aggs = {}
+    prices = TripLegPrices.new
     @key_to_best.values.each do |r|
-      bucket = minutes_since_midnight(r.departure) / minute_bucket_size
-      if aggs[bucket] == nil or aggs[bucket].price > r.price
-        aggs[bucket] = r
+      bucket_key = time_to_bucket_key(r.departure)
+      if prices.get(bucket_key) > r.price
+        prices.set(bucket_key, r.price)
       end
     end
-    text = ''
-    if aggs[0]
-      text += "early:$#{aggs[0].price}  "
+    return prices
+  end
+end
+
+class TripLegPrices
+  attr_accessor :prices
+  def initialize
+    @prices = { :early => Float::INFINITY, :morning => Float::INFINITY, :afternoon => Float::INFINITY, :evening => Float::INFINITY }
+  end
+  def get(key)
+    raise "Invalid key #{key}" if not [:early,:morning,:afternoon,:evening].include? key
+    return @prices[key]
+  end
+  def set(key, value)
+    raise "Invalid key #{key}" if not [:early,:morning,:afternoon,:evening].include? key
+    @prices[key] = value
+  end
+  def update_with_return_text(new_prices)
+    sms_text = ''
+    @prices.each do |time,price|
+      new_price = new_prices.get(time)
+      if price > new_price
+        sms_text += "#{time}: #{price} -> #{new_price}\n"
+      end
     end
-    if aggs[1]
-      text += "morning:$#{aggs[1].price}  "
+    new_prices.prices.each do |time,new_price|
+      set(time, new_price)
     end
-    if aggs[2]
-      text += "afternoon:$#{aggs[2].price}  "
+    sms_text
+  end
+end
+
+class TripLeg
+  attr_accessor :from, :to, :date, :short_date
+  def initialize(from, to, date)
+    @from       = from
+    @to         = to
+    @date       = date
+    @short_date = @date.split('/')[0..1].join('/')
+    @prices     = TripLegPrices.new
+  end
+  def update(new_prices)
+    sms_text = @prices.update_with_return_text(new_prices)
+    if sms_text == ''
+      return ''
+    else
+      return "\nUPDATE #{@short_date} #{@from}->#{@to}\n#{sms_text}"
     end
-    if aggs[3]
-      text += "evening:$#{aggs[3].price}"
-    end
-    text
+  end
+end
+
+class Trip
+  attr_accessor :going_leg, :return_leg, :num_passengers
+  def initialize(origin, dest, num_passengers, leave_date, return_date)
+    @going_leg  = TripLeg.new(origin, dest, leave_date)
+    @return_leg = TripLeg.new(dest, origin, return_date)
+    @num_passengers = num_passengers
+    @name = "#{@going_leg.short_date}-#{@return_leg.short_date} #{@going_leg.from}<->#{@going_leg.to}"
+  end
+  def update(going_prices, return_prices)
+    @going_leg.update(going_prices) + @return_leg.update(return_prices)
+  end
+  def to_s
+    @name
   end
 end
 
@@ -111,10 +173,9 @@ def load_personals(filename)
     key,value = line.split("=")
     key.chomp!
     value.chomp!
-    personals[:from]                = value if key == "from"
-    personals[:to]                  = value if key == "to"
-    personals[:twilio_account_sid]  = value if key == "twilio_account_sid"
-    personals[:twilio_auth_token]   = value if key == "twilio_auth_token"
+    raise "Duplicate key #{key}" if personals.include? key
+    personals[key] = value
+    LOG.info("set personals[#{key}] = #{personals[key]}")
   end
   return personals
 end
@@ -125,42 +186,66 @@ def load_trips(filename)
     line.chomp!
     next if line.length == 0 or line[0] == '#'
     split = line.split(':')
-    raise "Expected origin:dest:01/01/2000:12/31/2001, not '#{line}'" if split.length != 4
-    trips.push({:origin => split[0], :dest => split[1], :leave => split[2], :return => split[3]})
+    raise "Expected origin:dest:num_passengers:01/01/2000:12/31/2001, not '#{line}'" if split.length != 5
+    trips.push(Trip.new(split[0], split[1], split[2].to_s, split[3], split[4]))
   end
   return trips
 end
 
-def send_email(outbound_text, inbound_text)
-  body = <<BODY_END
-  OUTBOUND:
-  #{outbound_text}
+def send_sms_if_enabled(body, personals)
+  return if personals['sms.enabled'] != 'true'
 
-  INBOUND:
-  #{inbound_text}
-BODY_END
-
-  Pony.mail({:to => 'bowles.craig@gmail.com', :from => 'who@cares.com', :subject => 'SWA Flight Alert!', :body => body, :via => :sendmail})
-end
-
-def send_sms(body, personals)
 	# set up a client to talk to the Twilio REST API 
-	@client = Twilio::REST::Client.new(personals[:twilio_account_sid], personals[:twilio_auth_token])
+	@client = Twilio::REST::Client.new(personals['sms.twilio_account_sid'], personals['sms.twilio_auth_token'])
  
 	@client.account.messages.create({
-  	:from => personals[:from],
-  	:to   => personals[:to],
+  	:from => personals['sms.from'],
+  	:to   => personals['sms.to'],
     :body => body
 	})
   LOG.info("SMS sent!")
+end
+
+def setup_mail(personals)
+  return if personals['email.enabled'] != 'true'
+  options = { :address              => personals['email.smtp'],
+              :port                 => personals['email.port'].to_i,
+              :domain               => Socket.gethostname,
+              :user_name            => personals['email.username'],
+              :password             => personals['email.password'],
+              :authentication       => 'plain',
+              :enable_starttls_auto => true }
+  Mail.defaults do
+    delivery_method :smtp, options
+  end
+  LOG.info("mail setup!")
+end
+
+def send_email_if_enabled(subject, body_text, personals)
+  return if personals['email.enabled'] != 'true'
+
+  Mail.deliver do
+    from      'mymailbot69@gmail.com'
+    to        personals['email.to'].split(',')
+    subject   subject
+    body      body_text
+  end
+  LOG.info("mail sent!")
+end
+
+def send_it(subject, body, personals)
+  send_sms_if_enabled(body, personals)
+  send_email_if_enabled(subject, body, personals)
 end
 
 # args
 raise "USAGE: #{$PROGRAM_NAME} <personals.txt> <trips.txt>" unless ARGV.length == 2
 personals = load_personals(ARGV[0])
 trips     = load_trips(ARGV[1])
+setup_mail(personals)
 
 last_alert_time = Time.now
+first_run = true
 while(true)
   LOG.info("scraping...")
   trips.each do |trip|
@@ -170,12 +255,12 @@ while(true)
       page = agent.get('https://www.southwest.com')
       form = page.form_with(:name => 'homepage-booking-form-air')
 
-      form['originAirport']         = trip[:origin]
-      form['destinationAirport']    = trip[:dest]
-      form['returnAirport']         = trip[:oriign]
-      form['outboundDateString']    = trip[:leave]
-      form['returnDateString']      = trip[:return]
-      form['adultPassengerCount']   = '1'
+      form['originAirport']         = trip.going_leg.from
+      form['destinationAirport']    = trip.going_leg.to
+      form['returnAirport']         = '' #trip.return_leg.to
+      form['outboundDateString']    = trip.going_leg.date
+      form['returnDateString']      = trip.return_leg.date
+      form['adultPassengerCount']   = trip.num_passengers.to_s
       form['seniorPassengerCount']  = '0'
 
       submit_button = form.button_with(:name => 'submitButton')
@@ -194,21 +279,16 @@ while(true)
         end
       end
 
-      new_outbound_text = "OUT: " + outs.aggregated_bests
-      new_inbound_text  = "IN:  " + ins.aggregated_bests
-      new_text = "#{trip[:origin]}->#{trip[:dest]} on #{trip[:leave].split('/')[0..1].join('/')}: #{outs.aggregated_bests}" +
-               "\n#{trip[:dest]}->#{trip[:origin]} on #{trip[:return].split('/')[0..1].join('/')}: #{ins.aggregated_bests}"
-      if new_text != trip[:old_text]
-        LOG.info("new prices for #{trip}!")
-        new_text.split("\n").each { |line| LOG.info(line.chomp) }
-        if trip[:old_text]
-          send_sms(new_text, personals)
-          last_alert_time = Time.now
-        end
+      going_prices  = outs.aggregated_bests
+      return_prices =  ins.aggregated_bests
+      send_text = trip.update(going_prices, return_prices)
+      if send_text != '' and not first_run
+        send_text.split("\n").each { |line| LOG.info(line.chomp) }
+        send_it("PRICE UPDATE: #{trip}", send_text, personals)
+        last_alert_time = Time.now
       else
         LOG.info("no change for #{trip}")
       end
-      trip[:old_text] = new_text
     rescue
       LOG.error("failed to fetch details for #{trip}")
     end
@@ -218,7 +298,7 @@ while(true)
   hours_since_last_alert = (Time.now - last_alert_time) / 60 / 60
   LOG.info("#{hours_since_last_alert.round(3)} hours since startup or last alert")
   if hours_since_last_alert >= 24
-    send_sms("still alive!")
+    send_it("No new prices, but script still alive", "still alive!", personals)
     last_alert_time = Time.now
   end
 
@@ -226,5 +306,6 @@ while(true)
   sleep_seconds = 60 + rand(120)
   LOG.info("will sleep for #{sleep_seconds} seconds until next scrape")
   sleep(sleep_seconds)
+  first_run = false
 end
 
