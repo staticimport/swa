@@ -44,7 +44,7 @@ class Results
     return @csv[4]
   end
   def key
-    return "#{departure} -> #{arrival}"
+    return "#{departure} => #{arrival}"
   end
   def price
     split = @csv[2].split('@')
@@ -107,6 +107,12 @@ class TripLegPrices
   def initialize
     @prices = { :early => Float::INFINITY, :morning => Float::INFINITY, :afternoon => Float::INFINITY, :evening => Float::INFINITY }
   end
+  def has_any_prices
+    @prices.each do |key,value|
+      return true if value != Float::INFINITY
+    end
+    return false
+  end
   def get(key)
     raise "Invalid key #{key}" if not [:early,:morning,:afternoon,:evening].include? key
     return @prices[key]
@@ -119,14 +125,23 @@ class TripLegPrices
     sms_text = ''
     @prices.each do |time,price|
       new_price = new_prices.get(time)
-      if price > new_price
-        sms_text += "#{time}: #{price} -> #{new_price}\n"
+      if new_price < 0.85 * price
+        sms_text += "#{time}: #{"%.2f" % price} => #{"%.2f" % new_price}\n"
       end
     end
     new_prices.prices.each do |time,new_price|
       set(time, new_price)
     end
     sms_text
+  end
+  def current_prices_str
+    text = ''
+    @prices.each do |time,price|
+      if price != Float::INFINITY
+        text += "#{time}: #{"%.2f" % price}\n"
+      end
+    end
+    text
   end
 end
 
@@ -144,8 +159,14 @@ class TripLeg
     if sms_text == ''
       return ''
     else
-      return "\nUPDATE #{@short_date} #{@from}->#{@to}\n#{sms_text}"
+      return "\nUPDATE #{@short_date} #{@from} => #{@to}\n#{sms_text}"
     end
+  end
+  def current_prices_str
+    "CURRENT PRICES #{@short_date} #{@from} => #{@to}\n#{@prices.current_prices_str}"
+  end
+  def has_any_prices
+    return @prices.has_any_prices
   end
 end
 
@@ -155,13 +176,24 @@ class Trip
     @going_leg  = TripLeg.new(origin, dest, leave_date)
     @return_leg = TripLeg.new(dest, origin, return_date)
     @num_passengers = num_passengers
-    @name = "#{@going_leg.short_date}-#{@return_leg.short_date} #{@going_leg.from}<->#{@going_leg.to}"
+    @name = "#{@going_leg.short_date}-#{@return_leg.short_date} #{@going_leg.from} <=> #{@going_leg.to}"
   end
   def update(going_prices, return_prices)
     @going_leg.update(going_prices) + @return_leg.update(return_prices)
   end
   def to_s
     @name
+  end
+  def current_prices_str
+    text = "----------- #{@name} -----------\n"
+    [@going_leg,@return_leg].each do |leg|
+      if leg.has_any_prices
+        text += "#{leg.current_prices_str}\n"
+      else
+        text += "No prices for #{leg.short_date} #{leg.from} => #{leg.to}\n"
+      end
+    end
+    return text
   end
 end
 
@@ -196,6 +228,7 @@ def send_sms_if_enabled(body, personals)
   return if personals['sms.enabled'] != 'true'
 
 	# set up a client to talk to the Twilio REST API 
+  begin
 	@client = Twilio::REST::Client.new(personals['sms.twilio_account_sid'], personals['sms.twilio_auth_token'])
  
 	@client.account.messages.create({
@@ -203,6 +236,9 @@ def send_sms_if_enabled(body, personals)
   	:to   => personals['sms.to'],
     :body => body
 	})
+  rescue Exception => e
+    puts e
+  end
   LOG.info("SMS sent!")
 end
 
@@ -223,12 +259,20 @@ end
 
 def send_email_if_enabled(subject, body_text, personals)
   return if personals['email.enabled'] != 'true'
-
-  Mail.deliver do
-    from      'mymailbot69@gmail.com'
-    to        personals['email.to'].split(',')
-    subject   subject
-    body      body_text
+  
+  10.times do 
+    begin
+      Mail.deliver do
+        from      'mymailbot69@gmail.com'
+        to        personals['email.to'].split(',')
+        subject   subject
+        body      body_text
+      end
+      break
+    rescue
+      LOG.info("Mail failed, waiting and possibly trying again: " + e)
+      sleep(60)
+    end
   end
   LOG.info("mail sent!")
 end
@@ -244,8 +288,7 @@ personals = load_personals(ARGV[0])
 trips     = load_trips(ARGV[1])
 setup_mail(personals)
 
-last_alert_time = Time.now
-first_run = true
+last_summary_time = nil
 while(true)
   LOG.info("scraping...")
   trips.each do |trip|
@@ -263,10 +306,16 @@ while(true)
       form['adultPassengerCount']   = trip.num_passengers.to_s
       form['seniorPassengerCount']  = '0'
 
-      submit_button = form.button_with(:name => 'submitButton')
+      #puts 'here'
+      puts form.buttons.size
+      #div1 = form.div_with(:class => "booking-form--bottom-options-right-absolute")
+      #puts div1
+      #submit_button = form.button_with(:name => 'submitButton')
+      #submit_button = form.button_with(:id => 'jb-booking-form-submit-button')
+      submit_button = form.buttons[0]
       results_page = agent.submit(form, submit_button)
-
       results_form = results_page.form_with(:name => 'searchResults')
+      puts 'there'
 
       outs = ResultSet.new
       ins  = ResultSet.new
@@ -282,30 +331,33 @@ while(true)
       going_prices  = outs.aggregated_bests
       return_prices =  ins.aggregated_bests
       send_text = trip.update(going_prices, return_prices)
-      if send_text != '' and not first_run
+      if send_text != '' and last_summary_time != nil
         send_text.split("\n").each { |line| LOG.info(line.chomp) }
         send_it("PRICE UPDATE: #{trip}", send_text, personals)
-        last_alert_time = Time.now
       else
         LOG.info("no change for #{trip}")
       end
-    rescue
-      LOG.error("failed to fetch details for #{trip}")
+    rescue Exception => e
+      LOG.error("failed to fetch details for #{trip}: #{e}")
     end
   end
 
-  # need to send a heartbeat?
-  hours_since_last_alert = (Time.now - last_alert_time) / 60 / 60
-  LOG.info("#{hours_since_last_alert.round(3)} hours since startup or last alert")
-  if hours_since_last_alert >= 24
-    send_it("No new prices, but script still alive", "still alive!", personals)
-    last_alert_time = Time.now
+  # need to send a summary?
+  if last_summary_time == nil or (Time.now - last_summary_time) / 60 / 60 >= 24
+    LOG.info("sending summary email")
+    text = "This email is simply list of current prices and an indication that this script is still running. " +
+           "Prices are checked frequently and you will be alerted in a separate email whenever significant " +
+           "price drops are noticed.\n\n"
+    trips.each do |trip|
+      text += trip.current_prices_str + "\n\n"
+    end
+    send_it("Current Prices of Your Upcoming SWA Flights", text, personals)
+    last_summary_time = Time.now
   end
 
   # sleep random interval as not to appear scripted
   sleep_seconds = 60 + rand(120)
   LOG.info("will sleep for #{sleep_seconds} seconds until next scrape")
   sleep(sleep_seconds)
-  first_run = false
 end
 
